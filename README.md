@@ -153,3 +153,186 @@ Therefore, no need to escape and allocate.
 ```
 ./main.go:107:6: cannot inline algoTwo: function too complex: cost 309 exceeds budget 80
 ```
+
+```sh
+$ go test -bench . -benchmem --memprofile p.out -gcflags -m=2
+...
+./algoOne.go:10:26: &bytes.Buffer{...} escapes to heap:
+./algoOne.go:10:26:   flow: ~r0 = &{storage for &bytes.Buffer{...}}:
+./algoOne.go:10:26:     from &bytes.Buffer{...} (spill) at ./algoOne.go:10:26
+./algoOne.go:10:26:     from ~r0 = &bytes.Buffer{...} (assign-pair) at ./algoOne.go:10:26
+./algoOne.go:10:26:   flow: input = ~r0:
+./algoOne.go:10:26:     from input := ~r0 (assign) at ./algoOne.go:10:8
+./algoOne.go:10:26:   flow: io.r = input:
+./algoOne.go:10:26:     from input (interface-converted) at ./algoOne.go:36:29
+./algoOne.go:10:26:     from io.r, io.buf := input, buf[:end] (assign-pair) at ./algoOne.go:36:28
+./algoOne.go:10:26:   flow: {heap} = io.r:
+./algoOne.go:10:26:     from io.ReadAtLeast(io.r, io.buf, len(io.buf)) (call parameter) at ./algoOne.go:36:28
+./algoOne.go:8:14: parameter data leaks to {storage for &bytes.Buffer{...}} with derefs=0:
+./algoOne.go:8:14:   flow: bytes.buf = data:
+./algoOne.go:8:14:     from bytes.buf := data (assign-pair) at ./algoOne.go:10:26
+./algoOne.go:8:14:   flow: {storage for &bytes.Buffer{...}} = bytes.buf:
+./algoOne.go:8:14:     from bytes.Buffer{...} (struct literal element) at ./algoOne.go:10:26
+...
+```
+
+Notice that `&bytes.Buffer{...} escapes to heap:` and `from input (interface-converted) at ./algoOne.go:36:29`
+
+func `io.ReadFull` takes interface type `Reader` as first argument:
+`func ReadFull(r Reader, buf []byte) (n int, err error) {` and this will cause one allocation.
+
+_Converting a value to an interface in Go often leads to an allocation on the heap_. Here's why:
+Interface Internals
+An interface value in Go is represented internally as a pair of values:
+A pointer to the underlying concrete type's data.
+A pointer to the type's method table.
+Allocation When Converting
+When you convert a value to an interface, Go needs to create this interface value pair on the heap.
+This is because the interface value needs to store the type information of the concrete value, which can't be determined at compile time.
+
+Let's change `io.ReadFull` to `input.Read(buf[:end])` and run benchmark again:
+
+```sh
+$ go test -bench . -benchmem --memprofile p.out
+goos: darwin
+goarch: arm64
+pkg: practical-memory-profiling
+BenchmarkAlgorithmOne-8                  1160020              1025 ns/op              53 B/op          2 allocs/op
+BenchmarkAlgorithmTwo-8                  4278295               280.5 ns/op             0 B/op          0 allocs/op
+BenchmarkAlgorithmOneVersion2-8          1534524               905.3 ns/op             5 B/op          1 allocs/op
+PASS
+ok      practical-memory-profiling      7.108s
+```
+
+Memory allocation is reduced down to 1.
+
+Pprof with noinlines: `go tool pprof -noinlines p.out`
+
+```sh
+$ go tool pprof -noinlines p.out
+File: practical-memory-profiling.test
+Type: alloc_space
+Time: Nov 9, 2024 at 3:40pm (CST)
+Entering interactive mode (type "help" for commands, "o" for options)
+(pprof) list algoOneVersion2
+Total: 115MB
+ROUTINE ======================== practical-memory-profiling.algoOneVersion2 in /Users/yitao/practical-memory-profiling/algoOneVersion2.go
+      15MB       15MB (flat, cum) 13.04% of Total
+         .          .      7:func algoOneVersion2(data []byte, find []byte, repl []byte, output *bytes.Buffer) {
+         .          .      8:   // use a bytes buffer to provide a stream to process
+         .          .      9:   input := bytes.NewBuffer(data)
+         .          .     10:
+         .          .     11:   // the number of bytes we are looking for
+         .          .     12:   size := len(find)
+         .          .     13:
+         .          .     14:   // declare the buffers we need to process the stream.
+      15MB       15MB     15:   buf := make([]byte, size)
+         .          .     16:   end := size - 1
+         .          .     17:
+         .          .     18:   // Read in an initial number of bytes we need to get started
+         .          .     19:   if n, err := input.Read(buf[:end]); err != nil {
+         .          .     20:           output.Write(buf[:n])
+(pprof)
+```
+
+we still have one allocation `buf := make([]byte, size)`
+
+search through the escape analysis result we can find:
+
+```sh
+$ go test -bench . -benchmem --memprofile p.out -gcflags -m=2
+...
+./algoOneVersion2.go:15:13: make([]byte, size) escapes to heap:
+./algoOneVersion2.go:15:13:   flow: {heap} = &{storage for make([]byte, size)}:
+./algoOneVersion2.go:15:13:     from make([]byte, size) (non-constant size) at ./algoOneVersion2.go:15:13
+...
+```
+
+change `buf := make([]byte, size)` to `buf := make([]byte, 5)` will reduce one allocation.
+
+```sh
+$ go test -bench . -benchmem --memprofile p.out
+pkg: practical-memory-profiling
+BenchmarkAlgorithmOne-8                  1169751              1037 ns/op              53 B/op          2 allocs/op
+BenchmarkAlgorithmTwo-8                  4195002               292.6 ns/op             0 B/op          0 allocs/op
+BenchmarkAlgorithmOneVersion2-8          1874484               629.8 ns/op             0 B/op          0 allocs/op
+PASS
+ok      practical-memory-profiling      7.168s
+```
+
+But algoOneVersion2 is still quite slow. Let's now see cpu profile:
+
+```sh
+$ go test -bench . -benchmem --cpuprofile cpu.out
+goos: darwin
+goarch: arm64
+pkg: practical-memory-profiling
+BenchmarkAlgorithmOne-8                  1151667              1020 ns/op              53 B/op          2 allocs/op
+BenchmarkAlgorithmTwo-8                  4158492               283.9 ns/op             0 B/op          0 allocs/op
+BenchmarkAlgorithmOneVersion2-8          1850841               638.4 ns/op             0 B/op          0 allocs/op
+PASS
+ok      practical-memory-profiling      6.401s
+```
+
+```sh
+$ go tool pprof cpu.out
+File: practical-memory-profiling.test
+Type: cpu
+Time: Nov 9, 2024 at 3:48pm (CST)
+Duration: 5.25s, Total samples = 4.54s (86.49%)
+Entering interactive mode (type "help" for commands, "o" for options)
+(pprof) list algoOneVersion2
+Total: 4.54s
+ROUTINE ======================== practical-memory-profiling.algoOneVersion2 in /Users/yitao/practical-memory-profiling/algoOneVersion2.go
+     320ms      1.63s (flat, cum) 35.90% of Total
+         .          .      7:func algoOneVersion2(data []byte, find []byte, repl []byte, output *bytes.Buffer) {
+         .          .      8:   // use a bytes buffer to provide a stream to process
+         .          .      9:   input := bytes.NewBuffer(data)
+         .          .     10:
+         .          .     11:   // the number of bytes we are looking for
+         .          .     12:   size := len(find)
+         .          .     13:
+         .          .     14:   // declare the buffers we need to process the stream.
+         .          .     15:   buf := make([]byte, 5)
+         .          .     16:   end := size - 1
+         .          .     17:
+         .          .     18:   // Read in an initial number of bytes we need to get started
+         .          .     19:   if n, err := input.Read(buf[:end]); err != nil {
+      60ms       60ms     20:           output.Write(buf[:n])
+         .          .     21:           return
+         .          .     22:   }
+         .          .     23:
+         .          .     24:   for {
+         .          .     25:           // read in one byte from the input stream
+      10ms      510ms     26:           if _, err := input.Read(buf[end:]); err != nil {
+      10ms       10ms     27:                   output.Write(buf[:end])
+         .          .     28:                   return
+         .          .     29:           }
+         .          .     30:
+         .          .     31:           // if we have a match, replace the bytes
+         .      400ms     32:           if bytes.Equal(buf, find) {
+     230ms      310ms     33:                   output.Write(repl)
+         .          .     34:                   // read a new initial number of bytes
+         .       80ms     35:                   if n, err := input.Read(buf[:end]); err != nil {
+         .       20ms     36:                           output.Write(buf[:n])
+      10ms       10ms     37:                           return
+         .          .     38:                   }
+         .          .     39:                   continue
+         .          .     40:           }
+         .          .     41:
+         .          .     42:           // write the front byte since it has been compared
+         .      230ms     43:           output.WriteByte(buf[0])
+         .          .     44:           // slice that front byte out
+         .          .     45:           copy(buf, buf[1:])
+         .          .     46:   }
+         .          .     47:}
+(pprof)
+```
+
+this line takes most of the time:
+
+```
+         .      400ms     32:           if bytes.Equal(buf, find) {
+```
+
+Now you have found the bottleneck, you can of course keep optimizing this specifc function if you need using the techniques we have used above.

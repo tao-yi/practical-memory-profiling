@@ -23,3 +23,9 @@ func BenchmarkAlgorithmTwo(b *testing.B) {
 		algoTwo(in, find, repl, &output)
 	}
 }
+func BenchmarkAlgorithmOneVersion2(b *testing.B) {
+	for range b.N {
+		output.Reset()
+		algoOneVersion2(in, find, repl, &output)
+	}
+}
